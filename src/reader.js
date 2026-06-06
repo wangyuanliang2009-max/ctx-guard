@@ -7,17 +7,28 @@ const os = require('os');
 const CONTEXT_LIMIT = 1_000_000;
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 
+// Cowork 路径（Windows）
+const COWORK_BASE = path.join(
+  os.homedir(), 'AppData', 'Local', 'Packages',
+  'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming', 'Claude',
+  'local-agent-mode-sessions'
+);
+
 function findJsonlFiles(dir) {
   if (!fs.existsSync(dir)) return [];
   const results = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      results.push(...findJsonlFiles(full));
-    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
-      results.push(full);
+  try {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      try {
+        if (entry.isDirectory()) {
+          results.push(...findJsonlFiles(full));
+        } else if (entry.isFile() && entry.name.endsWith('.jsonl') && !entry.name.includes('audit')) {
+          results.push(full);
+        }
+      } catch (_) {}
     }
-  }
+  } catch (_) {}
   return results;
 }
 
@@ -32,11 +43,19 @@ function parseSession(filePath) {
       const entry = JSON.parse(line);
       if (entry.model) model = entry.model;
       if (entry.timestamp) lastTimestamp = entry.timestamp;
+      if (entry.message && entry.message.usage) {
+        const u = entry.message.usage;
+        inputTokens  += u.input_tokens                || 0;
+        outputTokens += u.output_tokens               || 0;
+        cacheRead    += u.cache_read_input_tokens     || 0;
+        cacheCreate  += u.cache_creation_input_tokens || 0;
+      }
       if (entry.usage) {
-        inputTokens  += entry.usage.input_tokens                || 0;
-        outputTokens += entry.usage.output_tokens               || 0;
-        cacheRead    += entry.usage.cache_read_input_tokens     || 0;
-        cacheCreate  += entry.usage.cache_creation_input_tokens || 0;
+        const u = entry.usage;
+        inputTokens  += u.input_tokens                || 0;
+        outputTokens += u.output_tokens               || 0;
+        cacheRead    += u.cache_read_input_tokens     || 0;
+        cacheCreate  += u.cache_creation_input_tokens || 0;
       }
     } catch (_) {}
   }
@@ -46,7 +65,10 @@ function parseSession(filePath) {
 }
 
 function findLatestSession() {
-  const files = findJsonlFiles(PROJECTS_DIR);
+  const files = [
+    ...findJsonlFiles(PROJECTS_DIR),
+    ...findJsonlFiles(COWORK_BASE),
+  ];
   if (!files.length) return null;
   const sessions = files.map(f => {
     try { const s = parseSession(f); s.mtime = fs.statSync(f).mtimeMs; return s; }
@@ -61,7 +83,11 @@ function findLatestSession() {
 }
 
 function getAllSessions() {
-  return findJsonlFiles(PROJECTS_DIR).map(f => {
+  const files = [
+    ...findJsonlFiles(PROJECTS_DIR),
+    ...findJsonlFiles(COWORK_BASE),
+  ];
+  return files.map(f => {
     try { const s = parseSession(f); s.mtime = fs.statSync(f).mtimeMs; return s; }
     catch (_) { return null; }
   }).filter(Boolean).sort((a, b) => {
