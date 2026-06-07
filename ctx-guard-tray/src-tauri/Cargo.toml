@@ -1,8 +1,8 @@
 [package]
 name = "ctx-guard-tray"
-version = "0.1.0"
-description = "ctx-guard - Claude context monitor"
-authors = ["you"]
+version = "2.1.0"
+description = "ctx-guard — Never lose your Cowork context again"
+authors = ["wangyuanliang2009-max"]
 edition = "2021"
 
 [lib]
