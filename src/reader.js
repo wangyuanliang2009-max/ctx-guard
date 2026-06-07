@@ -7,7 +7,6 @@ const os = require('os');
 const CONTEXT_LIMIT = 1_000_000;
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 
-// Cowork 路径（Windows）
 const COWORK_BASE = path.join(
   os.homedir(), 'AppData', 'Local', 'Packages',
   'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming', 'Claude',
@@ -41,17 +40,12 @@ function parseSession(filePath) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
-      if (entry.model) model = entry.model;
       if (entry.timestamp) lastTimestamp = entry.timestamp;
-      if (entry.message && entry.message.usage) {
+
+      // 只读 assistant 消息里的 usage，避免重复计算
+      if (entry.type === 'assistant' && entry.message && entry.message.usage) {
         const u = entry.message.usage;
-        inputTokens  += u.input_tokens                || 0;
-        outputTokens += u.output_tokens               || 0;
-        cacheRead    += u.cache_read_input_tokens     || 0;
-        cacheCreate  += u.cache_creation_input_tokens || 0;
-      }
-      if (entry.usage) {
-        const u = entry.usage;
+        if (entry.message.model) model = entry.message.model;
         inputTokens  += u.input_tokens                || 0;
         outputTokens += u.output_tokens               || 0;
         cacheRead    += u.cache_read_input_tokens     || 0;
