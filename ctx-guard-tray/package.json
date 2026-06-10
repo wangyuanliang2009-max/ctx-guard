@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "dev": "copy float.html public\\float.html /Y && vite",
+    "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

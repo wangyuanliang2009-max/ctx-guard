@@ -1,43 +1,109 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/src/styles.css" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
-    <script type="module" src="/src/main.ts" defer></script>
-  </head>
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; user-select:none; }
+  html, body { width:100%; height:100%; background:#0e0e16; overflow:hidden; font-family:-apple-system,"Microsoft YaHei",sans-serif; }
 
-  <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
+  /* 主窗口隐藏 */
+  #main { display:none; }
 
-      <div class="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/src/assets/vite.svg" class="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img
-            src="/src/assets/tauri.svg"
-            class="logo tauri"
-            alt="Tauri logo"
-          />
-        </a>
-        <a href="https://www.typescriptlang.org/docs" target="_blank">
-          <img
-            src="/src/assets/typescript.svg"
-            class="logo typescript"
-            alt="typescript logo"
-          />
-        </a>
-      </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
+  /* 悬浮窗 */
+  #float {
+    width:80px; height:96px;
+    background:#0e0e16;
+    display:flex; flex-direction:column;
+    align-items:center; justify-content:center;
+    gap:3px; cursor:grab; position:relative;
+  }
+  #float:active { cursor:grabbing; }
+  #ctx-label { font-size:8px; font-weight:700; letter-spacing:3px; color:rgba(34,197,94,0.6); line-height:1; transition:color .5s; }
+  #pct { font-size:22px; font-weight:800; color:#22c55e; letter-spacing:-1px; line-height:1; transition:color .5s; }
+  #bar-wrap { width:50px; height:2px; background:rgba(255,255,255,0.07); border-radius:1px; overflow:hidden; }
+  #bar { height:100%; background:#22c55e; border-radius:1px; width:100%; transition:width .8s ease,background .5s; }
+  #plan-lbl { font-size:8px; color:rgba(255,255,255,0.2); letter-spacing:0.3px; margin-top:1px; }
+  #close { position:absolute; top:5px; right:5px; width:13px; height:13px; border-radius:50%; background:rgba(255,255,255,0.05); color:rgba(255,255,255,0.25); font-size:9px; display:flex; align-items:center; justify-content:center; cursor:pointer; line-height:1; }
+  #close:hover { background:#ef4444; color:#fff; }
+  @keyframes flash { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  .flashing { animation:flash .8s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<div id="main"></div>
+<div id="float">
+  <div id="close">x</div>
+  <div id="ctx-label">CTX</div>
+  <div id="pct">100%</div>
+  <div id="bar-wrap"><div id="bar"></div></div>
+  <div id="plan-lbl">MAX 1M</div>
+</div>
+<script type="module">
+const isFloat = window.location.search.includes('float') || window.__IS_FLOAT__;
 
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
-    </main>
-  </body>
+if (!isFloat) {
+  document.getElementById('float').style.display = 'none';
+} else {
+  const PLAN_NAMES = {'1048576':'MAX 1M','524288':'MAX 500K','204800':'PRO 200K'};
+  const ctxLabel = document.getElementById('ctx-label');
+  const pctEl    = document.getElementById('pct');
+  const bar      = document.getElementById('bar');
+  const planEl   = document.getElementById('plan-lbl');
+  let maxBytes   = 1048576;
+
+  function setColor(color) {
+    const c  = color==='red'?'#ef4444':color==='yellow'?'#eab308':'#22c55e';
+    const lc = color==='red'?'rgba(239,68,68,0.7)':color==='yellow'?'rgba(234,179,8,0.6)':'rgba(34,197,94,0.6)';
+    pctEl.style.color=c; bar.style.background=c; ctxLabel.style.color=lc;
+  }
+
+  function update(sizeBytes, color, max) {
+    const r = Math.max(0, Math.min(1, 1 - sizeBytes/max));
+    pctEl.textContent = (r*100).toFixed(1)+'%';
+    bar.style.width = (r*100)+'%';
+    setColor(color);
+    planEl.textContent = PLAN_NAMES[String(max)] || 'CUSTOM';
+    r < 0.1 ? pctEl.classList.add('flashing') : pctEl.classList.remove('flashing');
+  }
+
+  async function init() {
+    let tries = 0;
+    while (!window.__TAURI_INTERNALS__ && tries < 30) {
+      await new Promise(r => setTimeout(r, 100)); tries++;
+    }
+    const { getCurrentWindow } = window.__TAURI__.window;
+    const win = getCurrentWindow();
+
+    document.getElementById('float').addEventListener('mousedown', async (e) => {
+      if (e.target.id === 'close') return;
+      try { await win.startDragging(); } catch(e) {}
+    });
+    document.getElementById('close').addEventListener('click', async () => {
+      try { await win.hide(); } catch(e) {}
+    });
+
+    try {
+      const saved = await window.__TAURI__.core.invoke('get_max_bytes');
+      if (saved > 0) { maxBytes = saved; planEl.textContent = PLAN_NAMES[String(maxBytes)] || 'CUSTOM'; }
+    } catch(e) {}
+
+    const { listen } = window.__TAURI__.event;
+    listen('float-update', (e) => {
+      const { sizeBytes, color, maxBytes: max } = e.payload;
+      if (max) maxBytes = max;
+      update(sizeBytes||0, color, maxBytes);
+    });
+    listen('plan-changed', (e) => {
+      maxBytes = e.payload;
+      planEl.textContent = PLAN_NAMES[String(maxBytes)] || 'CUSTOM';
+    });
+    listen('alert', () => {
+      pctEl.textContent='0%'; bar.style.width='0%';
+      setColor('red'); pctEl.classList.add('flashing');
+    });
+  }
+  init();
+}
+</script>
+</body>
 </html>

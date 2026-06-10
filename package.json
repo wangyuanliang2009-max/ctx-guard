@@ -1,1 +1,21 @@
-{"name":"ctx-guard","version":"1.1.0","description":"Claude Code context usage monitor","main":"src/reader.js","bin":{"ctx-guard":"./bin/ctx-guard.js"},"scripts":{"test":"node test/reader.test.js","demo":"node bin/ctx-guard.js --demo"},"engines":{"node":">=16"},"keywords":["claude","claude-code","context","monitor","token"],"author":"wangyuanliang2009-max","license":"MIT"} 
+{
+  "name": "ctx-guard-tray",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && copy public\\float.html dist\\float.html",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "vite": "^6.0.3",
+    "typescript": "~5.6.2"
+  }
+}
