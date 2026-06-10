@@ -1,6 +1,6 @@
 [package]
 name = "ctx-guard-tray"
-version = "2.1.0"
+version = "2.2.0"
 description = "ctx-guard — Never lose your Cowork context again"
 authors = ["wangyuanliang2009-max"]
 edition = "2021"
