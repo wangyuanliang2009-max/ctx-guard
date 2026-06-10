@@ -24,6 +24,13 @@ const KEYWORDS: &[&str] = &[
     "switch to standard context",
 ];
 
+/// 生成交接文档时回读日志末尾的字节数（8 MiB，足够覆盖最近若干轮对话）
+const HANDOFF_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+/// 交接文档中收录的最近用户消息条数
+const HANDOFF_MAX_MESSAGES: usize = 5;
+/// 真实用户消息在日志行中的特征：content 直接是字符串（工具返回则是数组 "content":[）
+const USER_CONTENT_MARKER: &str = "\"role\":\"user\",\"content\":\"";
+
 #[derive(Clone, Serialize)]
 struct FloatUpdate {
     status: String,
@@ -111,15 +118,150 @@ fn find_json_number(line: &str, key: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
-/// 读取文件末尾最多 max_tail 字节（用于启动时获取最近的token数）
+/// 读取文件末尾最多 max_tail 字节。
+/// v2.3.0 修复：之前用 read_to_string，如果 seek 落点正好切在一个多字节
+/// UTF-8 字符（如中文）中间会整体失败。改为按字节读取后做有损转换，
+/// 边界上的半个字符会被替换为占位符，不再导致整次读取失败。
 fn read_file_tail(path: &PathBuf, max_tail: u64) -> Option<String> {
     let mut file = OpenOptions::new().read(true).open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(max_tail);
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).ok()?;
-    Some(buf)
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// 解码一段 JSON 字符串字面量（传入开引号之后的内容），
+/// 处理 \n \t \" \\ \/ \uXXXX 等转义，遇到未转义的闭引号结束。
+/// 返回 None 表示这一行被截断（没找到闭引号），调用方应跳过该行。
+fn decode_json_string(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '"' { return Some(out); }
+        if c != '\\' { out.push(c); continue; }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => {}
+            'b' | 'f' => {}
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                    if (0xD800..0xDC00).contains(&cp) {
+                        // UTF-16 高代理项：尝试与紧随其后的 \uXXXX 低代理项组合
+                        let mut peek = chars.clone();
+                        if peek.next() == Some('\\') && peek.next() == Some('u') {
+                            let hex2: String = peek.by_ref().take(4).collect();
+                            if let Ok(low) = u32::from_str_radix(&hex2, 16) {
+                                if (0xDC00..0xE000).contains(&low) {
+                                    let combined = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                                    if let Some(ch) = char::from_u32(combined) {
+                                        out.push(ch);
+                                        chars = peek;
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(ch) = char::from_u32(cp) {
+                        out.push(ch);
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+/// 从一行日志中提取真实的用户输入原文。
+/// 关键区分：真实用户消息 content 是字符串（"content":"...）；
+/// 工具返回结果虽然 type 也是 user，但 content 是数组（"content":[），
+/// 不会命中带闭引号的 MARKER，因此被自然排除。
+fn extract_user_message(line: &str) -> Option<String> {
+    if !line.contains("\"type\":\"user\"") { return None; }
+    let pos = line.find(USER_CONTENT_MARKER)?;
+    decode_json_string(&line[pos + USER_CONTENT_MARKER.len()..])
+}
+
+/// 过滤命令类噪音（如 --model xxx、/compact 等不是"任务描述"的输入）
+fn is_noise_message(m: &str) -> bool {
+    let t = m.trim();
+    t.is_empty() || t.starts_with("--") || t.starts_with('/')
+}
+
+/// 把一条用户消息整理成单行预览：去掉 <uploaded_files> 头部噪音，
+/// 多行合并为 " / " 分隔，超长按字符截断（避免切坏中文）。
+fn clean_message_preview(m: &str, max_chars: usize) -> String {
+    let body = match m.find("</uploaded_files>") {
+        Some(p) => &m[p + "</uploaded_files>".len()..],
+        None => m,
+    };
+    let parts: Vec<&str> = body
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let joined = parts.join(" / ");
+    if joined.chars().count() > max_chars {
+        let cut: String = joined.chars().take(max_chars).collect();
+        format!("{}……", cut)
+    } else {
+        joined
+    }
+}
+
+/// 从消息中提取 Windows 盘符路径（如 D:\GITHUB\ctx-guard）。
+/// 规则：盘符前必须是单词边界（排除 http:// 这类误报），
+/// 冒号后必须是反斜杠，遇空白/引号/中文标点等停止。
+fn extract_win_paths(m: &str) -> Vec<String> {
+    let stop = " \t\n\"'<>|*?`，。；：！？（）【】";
+    let chars: Vec<char> = m.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i + 2 < chars.len() {
+        let boundary_ok = i == 0 || !chars[i - 1].is_alphanumeric();
+        if boundary_ok
+            && chars[i].is_ascii_alphabetic()
+            && chars[i + 1] == ':'
+            && chars[i + 2] == '\\'
+        {
+            let mut j = i;
+            while j < chars.len() && !stop.contains(chars[j]) { j += 1; }
+            let raw: String = chars[i..j].iter().collect();
+            let p = raw
+                .trim_end_matches(|c: char| c == '.' || c == '\\' || c == ',' || c == ')')
+                .to_string();
+            if p.chars().count() > 3 { out.push(p); }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// unix 秒 → 北京时间（年, 月, 日, 时, 分）。中国无夏令时，固定 UTC+8。
+/// 使用标准的 civil-from-days 历法算法，零依赖。
+fn beijing_time_parts(unix_secs: u64) -> (i64, i64, i64, u64, u64) {
+    let secs = unix_secs + 8 * 3600;
+    let days = (secs / 86400) as i64;
+    let tod = secs % 86400;
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, tod / 3600, (tod % 3600) / 60)
 }
 
 fn format_tokens(tokens: u64) -> String {
@@ -134,13 +276,97 @@ fn get_icon_path(tokens: u64, max: u64, app: &AppHandle) -> PathBuf {
     app.path().resource_dir().unwrap_or_else(|_| PathBuf::from(".")).join("icons").join(name)
 }
 
+/// v2.3.0 核心功能：自动填充的交接文档。
+/// 读取 audit.jsonl 末尾 8 MiB，提取最近 5 条去重后的真实用户消息、
+/// 消息中出现的文件路径、以及当前 context token 数，填入交接文档。
 fn generate_handoff(keyword: &str, audit_path: &str) -> String {
     let desktop = dirs::desktop_dir().unwrap_or_else(|| PathBuf::from("."));
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let out_path = desktop.join(format!("handoff_{}.md", now));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (y, mo, d, h, mi) = beijing_time_parts(now);
+    let out_path = desktop.join(format!("handoff_{:04}{:02}{:02}_{:02}{:02}.md", y, mo, d, h, mi));
+
+    let tail = read_file_tail(&PathBuf::from(audit_path), HANDOFF_TAIL_BYTES).unwrap_or_default();
+
+    // 当前 context（API 真实上报值）
+    let max = read_max_bytes();
+    let tokens = extract_latest_context_tokens(&tail).unwrap_or(0);
+    let ctx_line = if tokens > 0 {
+        format!(
+            "{} / {}（{:.0}%）",
+            format_tokens(tokens),
+            format_tokens(max),
+            tokens as f64 / max as f64 * 100.0
+        )
+    } else {
+        "未知（未能从日志解析到 token 数）".to_string()
+    };
+
+    // 倒序扫描日志，去重收集最近的真实用户消息
+    let mut seen: Vec<String> = Vec::new();
+    let mut messages: Vec<String> = Vec::new();
+    for line in tail.lines().rev() {
+        if messages.len() >= HANDOFF_MAX_MESSAGES { break; }
+        let Some(m) = extract_user_message(line) else { continue };
+        if is_noise_message(&m) { continue; }
+        let key = m.trim().to_string();
+        if seen.contains(&key) { continue; }
+        seen.push(key);
+        messages.push(m);
+    }
+    messages.reverse(); // 改为时间正序：旧 → 新
+
+    // 从这些消息中提取文件路径
+    let mut paths: Vec<String> = Vec::new();
+    for m in &messages {
+        for p in extract_win_paths(m) {
+            if !paths.contains(&p) { paths.push(p); }
+        }
+    }
+    paths.truncate(10);
+
+    let msg_section = if messages.is_empty() {
+        "（未能从日志中提取到用户消息——可能是全新 session）".to_string()
+    } else {
+        messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| format!("{}. {}", i + 1, clean_message_preview(m, 200)))
+            .collect::<Vec<String>>()
+            .join("\n")
+    };
+
+    let path_section = if paths.is_empty() {
+        "- （最近消息中未发现文件路径）".to_string()
+    } else {
+        paths
+            .iter()
+            .map(|p| format!("- `{}`", p))
+            .collect::<Vec<String>>()
+            .join("\n")
+    };
+
     let content = format!(
-        "# ctx-guard 自动生成交接文档\n\n触发信号：`{}`\n来源文件：{}\n\n---\n\n## 项目状态（请手动补充）\n\n- **当前任务**：\n- **完成进度**：\n- **下一步**：\n\n*由 ctx-guard 自动生成*\n",
-        keyword, audit_path
+        "# ctx-guard 自动交接文档\n\n\
+**生成时间**：{:04}-{:02}-{:02} {:02}:{:02}（北京时间）\n\
+**触发方式**：`{}`\n\
+**来源日志**：{}\n\
+**当前 context**：{}\n\n\
+---\n\n\
+## 最近在做什么（自动提取自最近的用户消息，旧 → 新）\n\n\
+{}\n\n\
+## 涉及的文件路径（自动提取）\n\n\
+{}\n\n\
+---\n\n\
+## 需要你补充的两句话\n\n\
+- **当前卡在哪一步**：\n\
+- **下一步要做什么**：\n\n\
+## 用法\n\n\
+开新对话，把本文档整个粘贴或上传，并说：\"请根据这份交接文档继续。\"\n\n\
+*由 ctx-guard v2.3.0 自动生成*\n",
+        y, mo, d, h, mi, keyword, audit_path, ctx_line, msg_section, path_section
     );
     let _ = fs::write(&out_path, &content);
     out_path.to_string_lossy().to_string()
@@ -205,13 +431,15 @@ fn start_watcher(app: AppHandle) {
             let current_size = fs::metadata(&audit_path).map(|m| m.len()).unwrap_or(0);
             let prev_size = *last_file_size.lock().unwrap();
 
-            // 文件有新增：只读增量部分，从中提取最新token数和关键词
+            // 文件有新增：只读增量部分，从中提取最新token数和关键词。
+            // v2.3.0 修复：增量起点可能切在多字节字符中间，改为字节读取+有损转换。
             if current_size > prev_size {
-                let mut chunk = String::new();
+                let mut chunk_bytes: Vec<u8> = Vec::new();
                 if let Ok(mut file) = OpenOptions::new().read(true).open(&audit_path) {
                     let _ = file.seek(SeekFrom::Start(prev_size));
-                    let _ = file.read_to_string(&mut chunk);
+                    let _ = file.read_to_end(&mut chunk_bytes);
                 }
+                let chunk = String::from_utf8_lossy(&chunk_bytes).into_owned();
                 *last_file_size.lock().unwrap() = current_size;
 
                 if let Some(tokens) = extract_latest_context_tokens(&chunk) {
