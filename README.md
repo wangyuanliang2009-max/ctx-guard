@@ -7,7 +7,7 @@
 监控 Claude Cowork 的真实 context 用量，在撞上限制前自动生成交接文档。
 
 [功能](#-功能) · [安装](#-安装) · [工作原理](#-工作原理) · [常见问题](#-常见问题)
-
+<img src="screenshot.png" width="180" alt="ctx-guard floating widget">
 </div>
 
 ---
