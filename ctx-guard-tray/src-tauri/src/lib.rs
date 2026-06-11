@@ -18,6 +18,24 @@ fn get_max_bytes() -> u64 { read_max_bytes() }
 #[tauri::command]
 fn set_max_bytes(val: u64) { write_max_bytes(val); }
 
+/// 悬浮窗右键菜单"立即生成交接文档"调用
+#[tauri::command]
+fn generate_handoff_manual(app: AppHandle) {
+    if let Some(p) = find_latest_audit() {
+        let out = generate_handoff("手动触发", &p.to_string_lossy());
+        show_notification("ctx-guard", "交接文档已保存到桌面！");
+        let _ = app.emit("alert", &out);
+    } else {
+        show_notification("ctx-guard", "未找到 audit.jsonl，请先启动 Cowork。");
+    }
+}
+
+/// 悬浮窗右键菜单"退出"调用
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
 const KEYWORDS: &[&str] = &[
     "Usage credits required for 1M context",
     "turn on usage credits",
@@ -484,7 +502,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec![])))
-        .invoke_handler(tauri::generate_handler![get_max_bytes, set_max_bytes])
+        .invoke_handler(tauri::generate_handler![get_max_bytes, set_max_bytes, generate_handoff_manual, quit_app])
         .setup(|app| {
             use tauri_plugin_autostart::ManagerExt;
             let _ = app.autolaunch().enable();
