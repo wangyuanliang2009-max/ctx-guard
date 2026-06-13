@@ -8,6 +8,8 @@
 
 [功能](#-功能) · [安装](#-安装) · [工作原理](#-工作原理) · [常见问题](#-常见问题)
 <img src="screenshot.png" width="180" alt="ctx-guard floating widget">
+<img src="screenshot2.png" width="180" alt="ctx-guard handoff doc">
+<img src="screenshot3.png" width="180" alt="ctx-guard right-click menu">
 </div>
 
 ---
