@@ -294,9 +294,27 @@ fn get_icon_path(tokens: u64, max: u64, app: &AppHandle) -> PathBuf {
     app.path().resource_dir().unwrap_or_else(|_| PathBuf::from(".")).join("icons").join(name)
 }
 
-/// v2.3.0 核心功能：自动填充的交接文档。
-/// 读取 audit.jsonl 末尾 8 MiB，提取最近 5 条去重后的真实用户消息、
-/// 消息中出现的文件路径、以及当前 context token 数，填入交接文档。
+/// v2.5.0：从日志头部读取任务总纲（session 第一条真实用户消息）。
+/// 头部通常是整个 session 的需求书，是新对话恢复上下文最重要的部分。
+fn extract_task_summary(audit_path: &str) -> Option<String> {
+    let path = PathBuf::from(audit_path);
+    let mut file = OpenOptions::new().read(true).open(&path).ok()?;
+    let mut buf = vec![0u8; 65536]; // 读头部 64 KB
+    let n = file.read(&mut buf).ok()?;
+    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+    // 正序扫描，找第一条非噪音的真实用户消息
+    for line in head.lines() {
+        let Some(m) = extract_user_message(line) else { continue };
+        if is_noise_message(&m) { continue; }
+        return Some(m);
+    }
+    None
+}
+
+/// v2.5.0：自动填充的交接文档（含任务总纲）。
+/// - 头部：session 第一条用户消息（任务总纲）
+/// - 中部：最近 5 条用户消息（断点现场）
+/// - 底部：涉及的文件路径 + 当前 context 用量
 fn generate_handoff(keyword: &str, audit_path: &str) -> String {
     let desktop = dirs::desktop_dir().unwrap_or_else(|| PathBuf::from("."));
     let now = std::time::SystemTime::now()
@@ -322,9 +340,20 @@ fn generate_handoff(keyword: &str, audit_path: &str) -> String {
         "未知（未能从日志解析到 token 数）".to_string()
     };
 
+    // v2.5.0 新增：任务总纲（session 开头第一条消息）
+    let summary = extract_task_summary(audit_path);
+    let summary_section = match &summary {
+        Some(m) => clean_message_preview(m, 400),
+        None => "（未能提取——可能是全新 session 或日志头部无用户消息）".to_string(),
+    };
+
     // 倒序扫描日志，去重收集最近的真实用户消息
     let mut seen: Vec<String> = Vec::new();
     let mut messages: Vec<String> = Vec::new();
+    // 如果任务总纲和最近消息是同一条（短 session），把总纲加入 seen 避免重复
+    if let Some(ref s) = summary {
+        seen.push(s.trim().to_string());
+    }
     for line in tail.lines().rev() {
         if messages.len() >= HANDOFF_MAX_MESSAGES { break; }
         let Some(m) = extract_user_message(line) else { continue };
@@ -334,11 +363,12 @@ fn generate_handoff(keyword: &str, audit_path: &str) -> String {
         seen.push(key);
         messages.push(m);
     }
-    messages.reverse(); // 改为时间正序：旧 → 新
+    messages.reverse(); // 时间正序：旧 → 新
 
-    // 从这些消息中提取文件路径
+    // 从总纲 + 最近消息中提取文件路径
     let mut paths: Vec<String> = Vec::new();
-    for m in &messages {
+    let all_msgs = summary.iter().chain(messages.iter());
+    for m in all_msgs {
         for p in extract_win_paths(m) {
             if !paths.contains(&p) { paths.push(p); }
         }
@@ -346,7 +376,7 @@ fn generate_handoff(keyword: &str, audit_path: &str) -> String {
     paths.truncate(10);
 
     let msg_section = if messages.is_empty() {
-        "（未能从日志中提取到用户消息——可能是全新 session）".to_string()
+        "（与任务总纲为同一条消息，或 session 过短）".to_string()
     } else {
         messages
             .iter()
@@ -357,7 +387,7 @@ fn generate_handoff(keyword: &str, audit_path: &str) -> String {
     };
 
     let path_section = if paths.is_empty() {
-        "- （最近消息中未发现文件路径）".to_string()
+        "- （消息中未发现文件路径）".to_string()
     } else {
         paths
             .iter()
@@ -373,7 +403,10 @@ fn generate_handoff(keyword: &str, audit_path: &str) -> String {
 **来源日志**：{}\n\
 **当前 context**：{}\n\n\
 ---\n\n\
-## 最近在做什么（自动提取自最近的用户消息，旧 → 新）\n\n\
+## 任务总纲（session 开头，自动提取）\n\n\
+{}\n\n\
+---\n\n\
+## 最近在做什么（最近 5 条用户消息，旧 → 新）\n\n\
 {}\n\n\
 ## 涉及的文件路径（自动提取）\n\n\
 {}\n\n\
@@ -383,8 +416,9 @@ fn generate_handoff(keyword: &str, audit_path: &str) -> String {
 - **下一步要做什么**：\n\n\
 ## 用法\n\n\
 开新对话，把本文档整个粘贴或上传，并说：\"请根据这份交接文档继续。\"\n\n\
-*由 ctx-guard v2.3.0 自动生成*\n",
-        y, mo, d, h, mi, keyword, audit_path, ctx_line, msg_section, path_section
+*由 ctx-guard v2.5.0 自动生成*\n",
+        y, mo, d, h, mi, keyword, audit_path, ctx_line,
+        summary_section, msg_section, path_section
     );
     let _ = fs::write(&out_path, &content);
     out_path.to_string_lossy().to_string()
